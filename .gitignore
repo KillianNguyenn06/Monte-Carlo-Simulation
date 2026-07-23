@@ -1,0 +1,15 @@
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# CSV Data Exports & Temp files
+*.csv
+
+# Go Binary Executables & OS junk
+*.exe
+*.out
+main
+.DS_Store
+.vscode/
