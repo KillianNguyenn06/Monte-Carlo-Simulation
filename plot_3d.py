@@ -40,7 +40,7 @@ fig = go.Figure(data=[go.Surface(
 
 # 6. Set 3D Camera and Axis Labels
 fig.update_layout(
-    title="Interactive 3D Monte Carlo Option Price Surface",
+    title="Interactive 3D Monte Carlo Simulation",
     scene=dict(
         xaxis_title="Strike Price ($)",
         yaxis_title="Expiration (Days)",

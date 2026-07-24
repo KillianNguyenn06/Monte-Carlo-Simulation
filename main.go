@@ -127,6 +127,7 @@ type MonteCarlo struct {
 	Steps           int       // 252 for Standard, 100 for shorter interval
 	Simulation      int       // 50000 to 100000, 100000 for Standard
 	CallOrPut       string    // Call or Put Contract
+	pathCount       int       // N
 }
 
 type Performance struct {
@@ -139,6 +140,7 @@ func main() {
 	simulation.Steps = 252
 	simulation.Simulation = 100000
 	simulation.RiskFreeRate = 0.0455
+	simulation.pathCount = 50
 	storeAPI(simulation)
 
 	numRows := len(simulation.StrikePrice)
@@ -146,12 +148,18 @@ func main() {
 	// Initialize Grid
 	grid := make([][]float64, numRows)
 	timeGrid := make([][]float64, numRows)
+	assetPrice := make([][]float64, numRows)
 	for i := 0; i < numRows; i++ {
 		grid[i] = make([]float64, numCols)
 		timeGrid[i] = make([]float64, numCols)
+		assetPrice[i] = make([]float64, numCols)
 	}
 
 	displayOption(simulation, grid, timeGrid)
+	// We pick the longest expiration day (or a default horizon T) for the time timeline
+	maxDays := simulation.ExpirationDays[len(simulation.ExpirationDays)-1]
+	T := maxDays / 365.0
+	assetPrice = assetPriceSim(simulation.UnderlyingPrice, simulation.RiskFreeRate, T, simulation.Volatility, simulation.Steps, simulation.pathCount)
 
 	isWrite := false
 	for {
@@ -170,7 +178,8 @@ func main() {
 			os.Exit(0)
 		} else {
 			isWrite = true
-			writeCSV(simulation, grid)
+			writeHeatMapCSV(simulation, grid)
+			writeAssetPriceCSV(assetPrice)
 		}
 		if isWrite {
 			break
@@ -181,8 +190,10 @@ func main() {
 }
 
 // Several things add:
-// Path Count
+// Asset Price // Done
 // Execution Time (ms) // Done
 // Standard Error
 // Greeks
 // Write file to Create Heat Map // Done
+// Write file to Create Asset Price // Done
+// go run . && (./.venv/bin/python plot_3d.py & ./.venv/bin/python plot_path.py & wait)

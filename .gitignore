@@ -6,6 +6,7 @@ __pycache__/
 
 # CSV Data Exports & Temp files
 *.csv
+*.html
 
 # Go Binary Executables & OS junk
 *.exe
