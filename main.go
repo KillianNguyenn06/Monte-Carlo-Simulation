@@ -14,11 +14,12 @@ import (
 // 1) Stock API Object
 // =================================================
 type stockAPI struct {
-	Symbol  string  `json:"symbol"`
-	Price   float64 `json:"price"`
-	DayLow  float64 `json:"dayLow"`
-	DayHigh float64 `json:"dayHigh"`
-	Volume  float64 `json:"volume"`
+	Symbol    string  `json:"symbol"`
+	Price     float64 `json:"price"`
+	DayLow    float64 `json:"dayLow"`    // Not Yet Used
+	DayHigh   float64 `json:"dayHigh"`   // Not Yet Used
+	Volume    float64 `json:"volume"`    // Not Yet Used
+	MarketCap float64 `json:"marketCap"` // Not Yet Used
 }
 
 // =================================================
@@ -54,6 +55,7 @@ func (sim *MonteCarlo) fetchAPI(symbol string, apiKey string) error {
 	}
 
 	data := api[0]
+	sim.Volume = data.Volume
 	sim.StockSymbol = data.Symbol
 	sim.UnderlyingPrice = data.Price
 	sim.StrikePrice = strikePrice(data.Price)
@@ -127,7 +129,8 @@ type MonteCarlo struct {
 	Steps           int       // 252 for Standard, 100 for shorter interval
 	Simulation      int       // 50000 to 100000, 100000 for Standard
 	CallOrPut       string    // Call or Put Contract
-	pathCount       int       // N
+	PathCount       int       // N
+	Volume          float64
 }
 
 type Performance struct {
@@ -137,10 +140,11 @@ type Performance struct {
 func main() {
 
 	simulation := &MonteCarlo{}
+	data := &stockAPI{}
 	simulation.Steps = 252
 	simulation.Simulation = 100000
 	simulation.RiskFreeRate = 0.0455
-	simulation.pathCount = 50
+	simulation.PathCount = 50
 	storeAPI(simulation)
 
 	numRows := len(simulation.StrikePrice)
@@ -155,11 +159,11 @@ func main() {
 		assetPrice[i] = make([]float64, numCols)
 	}
 
-	displayOption(simulation, grid, timeGrid)
+	displayOption(simulation, data, grid, timeGrid)
 	// We pick the longest expiration day (or a default horizon T) for the time timeline
 	maxDays := simulation.ExpirationDays[len(simulation.ExpirationDays)-1]
 	T := maxDays / 365.0
-	assetPrice = assetPriceSim(simulation.UnderlyingPrice, simulation.RiskFreeRate, T, simulation.Volatility, simulation.Steps, simulation.pathCount)
+	assetPrice = assetPriceSim(simulation.UnderlyingPrice, simulation.RiskFreeRate, T, simulation.Volatility, simulation.Steps, simulation.PathCount)
 
 	isWrite := false
 	for {

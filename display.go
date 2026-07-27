@@ -10,11 +10,12 @@ import (
 // =================================================
 // 1) Display Option's Contract Pricing
 // =================================================
-func displayOption(sim *MonteCarlo, grid [][]float64, timeGrid [][]float64) ([][]float64, [][]float64) {
+func displayOption(sim *MonteCarlo, data *stockAPI, grid [][]float64, timeGrid [][]float64) ([][]float64, [][]float64) {
 
 	// Header Info (Indented)
 	fmt.Println("\n\t====================== OPTION'S CONTRACT PRICE ======================")
 	fmt.Printf("\n\tStock Symbol : %v", sim.StockSymbol)
+	fmt.Printf("\t\t\t\t\tVolume: %v", formatNumber(sim.Volume))
 	fmt.Printf("\n\tContract Type: %v", sim.CallOrPut)
 	fmt.Printf("\n\tS0 = $%.2f, r = %.1f%%, σ = %.1f%%\n\n", sim.UnderlyingPrice, sim.RiskFreeRate*100, sim.Volatility*100)
 

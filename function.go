@@ -182,21 +182,30 @@ func assetPriceSim(S0, r, T, sigma float64, steps, pathCount int) [][]float64 {
 	// Asset Price is 2D x-Price and y-Time steps
 	paths := make([][]float64, pathCount)
 
+	var wg sync.WaitGroup
+
 	for i := 0; i < pathCount; i++ { // Outer loop runs once for each 'universe'
 
-		path := make([]float64, steps+1) // Needs step+1 because Day start from 0
-		path[0] = S0                     // Every 'universe' or version, start with current stock price
-		st := S0
-		for j := 0; j < steps; j++ { // Inner loop advances time day-by-day
+		wg.Add(1)
 
-			z := rand.NormFloat64()
-			diffusion := volatilitySq * z
-			st = st * math.Exp(drift+diffusion)
-			path[j+1] = st // Save price into today's slot
-		}
-		paths[i] = path
+		go func(pathIndex int) {
+
+			defer wg.Done()
+			path := make([]float64, steps+1) // Needs step+1 because Day start from 0
+			path[0] = S0                     // Every 'universe' or version, start with current stock price
+			st := S0
+			localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(pathIndex)))
+
+			for j := 0; j < steps; j++ { // Inner loop advances time day-by-day
+				z := localRand.NormFloat64()
+				diffusion := volatilitySq * z
+				st = st * math.Exp(drift+diffusion)
+				path[j+1] = st // Save price into today's slot
+			}
+			paths[pathIndex] = path
+		}(i)
 	}
-
+	wg.Wait()
 	return paths
 }
 
@@ -244,4 +253,20 @@ func writeAssetPriceCSV(grid [][]float64) error {
 
 	fmt.Printf("\n\tSuccessfully Store Data in %v!\n", fileName)
 	return nil
+}
+
+func formatNumber(num float64) string {
+	if num >= 1_000_000_000_000 {
+		return fmt.Sprintf("%.2fT", float64(num)/1_000_000_000_000)
+	}
+	if num >= 1_000_000_000 {
+		return fmt.Sprintf("%.2fB", float64(num)/1_000_000_000)
+	}
+	if num >= 1_000_000 {
+		return fmt.Sprintf("%.2fM", float64(num)/1_000_000)
+	}
+	if num >= 1_000 {
+		return fmt.Sprintf("%.2fK", float64(num)/1_000)
+	}
+	return fmt.Sprintf("%.2f", num)
 }
