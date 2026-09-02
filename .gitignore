@@ -11,6 +11,7 @@ __pycache__/
 # Go Binary Executables & OS junk
 *.exe
 *.out
+coverage.out
 main
 .DS_Store
 .vscode/

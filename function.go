@@ -1,272 +1,471 @@
 package main
 
 import (
-	"encoding/csv" // Write CSV
+	"encoding/csv"
 	"fmt"
 	"math"
-	"math/rand" // Randomize Variable Z
+	"math/rand"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-func pause() {
-	fmt.Print("\n\tPress Enter to continue...")
-	fmt.Scanln()
-	fmt.Print("\033[H\033[2J")
+const (
+	americanStyle      = "AMERICAN"
+	europeanStyle      = "EUROPEAN"
+	callContract       = "CALL"
+	putContract        = "PUT"
+	tradingDaysPerYear = 252
+)
+
+type PricingInput struct {
+	Spot          float64
+	Strike        float64
+	Rate          float64
+	DividendYield float64
+	TimeYears     float64
+	Volatility    float64
+	Steps         int
+	Simulations   int
+	ContractType  string
+	ExerciseStyle string
+	Seed          int64
+	Workers       int
 }
 
-// =================================================
-// 1) Monte Carlo Option Pricing Simulation
-// =================================================
-func MonteCarloSim(S0, K, r, T, sigma float64, steps, simulation int, contractType string) (float64, float64) {
+type PricingResult struct {
+	Price          float64
+	StandardError  float64
+	ExecutionTime  float64
+	SimulatedPaths int
+	Seed           int64
+}
 
-	dt := T / float64(steps)
-	var avgPayoff float64
-	var totalPayOff float64
-
-	numWorkers := runtime.GOMAXPROCS(0) // Return Number of Usable CPU Core
-	totalBatches := simulation / numWorkers
-	remainder := simulation % numWorkers
-	if totalBatches == 0 {
-		totalBatches = 1 // In case simulation < number of CPU core
+func PriceOption(input PricingInput) (PricingResult, error) {
+	input.ContractType = strings.ToUpper(strings.TrimSpace(input.ContractType))
+	input.ExerciseStyle = strings.ToUpper(strings.TrimSpace(input.ExerciseStyle))
+	if err := validatePricingInput(input); err != nil {
+		return PricingResult{}, err
+	}
+	if input.Seed == 0 {
+		input.Seed = time.Now().UnixNano()
 	}
 
-	// Constant Calculation
-	drift := (r - math.Pow(sigma, 2)/2.0) * dt // Drift does not change since it all constants
-	volatilitySq := sigma * math.Sqrt(dt)
 	start := time.Now()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex // Mutex to prevent data race on totalPayOff
-
-	for w := 0; w < numWorkers; w++ {
-
-		wg.Add(1) // => Create 'job'
-
-		count := totalBatches
-		if w == numWorkers-1 { // Check if it's the last worker w: 3 == 4 - 1
-			count += remainder // Handle leftover, add it to the last batch for the last worker
-		}
-		go func(workerID int, numOfSimulation int) {
-
-			defer wg.Done() // => Assign 'job'
-
-			/*	Worker ID essential for the localRand so no Worker generate the same seed
-				seed = time.Now().UnixNano() to ensure we seed and generate different number everytime */
-			localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
-			var localPayoff float64
-
-			for i := 0; i < totalBatches; i++ {
-				st := S0
-				for j := 0; j < steps; j++ {
-					z := localRand.NormFloat64()  // Generate Rand but with bell curve distribution center 0.0
-					diffusion := volatilitySq * z // Diffusion changes every Steps since Z randomize
-					st = st * math.Exp(drift+diffusion)
-				}
-				if contractType == "CALL" {
-					localPayoff += math.Max(st-K, 0)
-				} else {
-					localPayoff += math.Max(K-st, 0)
-				}
-			}
-			/*	First Come First Serve (Mutex)
-				Worker 1 comes first => Get to add to totalPayOff first => Key is locked
-				Worker 2 waits in the meantime until Worker 1 done */
-			mu.Lock()
-			totalPayOff += localPayoff
-			mu.Unlock()
-		}(w, count)
+	var result PricingResult
+	var err error
+	if input.ExerciseStyle == americanStyle {
+		result, err = priceAmericanLSM(input)
+	} else {
+		result, err = priceEuropean(input)
 	}
-	wg.Wait()
-
-	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
-	avgPayoff = totalPayOff / float64(simulation)
-	discountedPrice := math.Exp(-r*T) * avgPayoff
-
-	return discountedPrice, float64(elapsed)
+	result.ExecutionTime = float64(time.Since(start).Microseconds()) / 1_000
+	result.Seed = input.Seed
+	return result, err
 }
 
-// =================================================
-// 2) Generate Expiration Date:
-// 0dte, +7dte, +7dte, +30dte, +30dte
-// =================================================
-func expirationdDate(exp float64) []float64 {
-
-	current := exp
-	expiration := make([]float64, 5)
-	expiration[0] = current
-
-	for i := 1; i <= 4; i++ {
-		current += 7
-		expiration[i] += current
+func validatePricingInput(input PricingInput) error {
+	if !isFinitePositive(input.Spot) {
+		return fmt.Errorf("spot price must be finite and greater than zero")
 	}
-
-	return expiration
-}
-
-// =================================================
-// 3) Generate Strike Price based on Current Price
-// 90%, 95%, 1, 105%, 110%
-// =================================================
-func strikePrice(s float64) []float64 {
-	strike := []float64{s * 0.90, s * 0.95, s, s * 1.05, s * 1.10}
-	return strike
-}
-
-// =================================================
-// 4) Generate Volatility based on Parkinson Sim
-// =================================================
-func parkinsonVolatility(high, low float64) float64 {
-	if low < 0 || high <= low {
-		return 0.25
+	if !isFinitePositive(input.Strike) {
+		return fmt.Errorf("strike price must be finite and greater than zero")
 	}
-
-	logHL := math.Log(high / low)
-	volatility := math.Sqrt(math.Pow(logHL, 2)/4*math.Log(2)) * math.Sqrt(252)
-
-	return volatility
-}
-
-// =================================================
-// 5) Store Strikes, Expiration, OptionPrice in CSV
-// =================================================
-func writeHeatMapCSV(sim *MonteCarlo, grid [][]float64) error {
-
-	fileName := "MonteCarloSim.csv"
-	file, err := os.Create(fileName) // Create file, if exist, return err
-	if err != nil {
-		return fmt.Errorf("\n\tFailed to Create CSV: %v", err)
+	if !isFinite(input.Rate) || input.Rate <= -1 {
+		return fmt.Errorf("risk-free rate must be finite and greater than -100%%")
 	}
-	defer file.Close() // Ensure file Close
-
-	w := csv.NewWriter(file) // Create "Writer", auto handle Escaping Special Char and auto add commas
-	defer w.Flush()          // "Flush" data to the file, w/o this, file might Corrupted/Empty
-	// Always place after NewWriter
-
-	header := []string{"Strike_X", "Expiration_Y", "OptionPrice_Z"} // Define Column's Name
-	if err := w.Write(header); err != nil {
-		return err
+	if !isFinite(input.DividendYield) || input.DividendYield < 0 {
+		return fmt.Errorf("dividend yield must be finite and nonnegative")
 	}
-
-	for i, strike := range sim.StrikePrice {
-		for j, days := range sim.ExpirationDays {
-			row := []string{ // Build a 3-element string slice representing 1 single coordinate row in CSV
-				fmt.Sprintf("%.2f", strike),
-				fmt.Sprintf("%.0f", days),
-				fmt.Sprintf("%.2f", grid[i][j]),
-			}
-			if err := w.Write(row); err != nil {
-				return err // Write that single data row (include 3 elements) to CSV
-			}
-		}
+	if !isFinite(input.TimeYears) || input.TimeYears < 0 {
+		return fmt.Errorf("time to expiration must be finite and nonnegative")
 	}
-	fmt.Printf("\n\tSuccessfully Store Data in %v!\n", fileName)
+	if !isFinitePositive(input.Volatility) {
+		return fmt.Errorf("volatility must be finite and greater than zero")
+	}
+	if input.Steps <= 0 {
+		return fmt.Errorf("steps must be greater than zero")
+	}
+	if input.Simulations <= 0 {
+		return fmt.Errorf("simulations must be greater than zero")
+	}
+	if input.ContractType != callContract && input.ContractType != putContract {
+		return fmt.Errorf("contract type must be CALL or PUT")
+	}
+	if input.ExerciseStyle != americanStyle && input.ExerciseStyle != europeanStyle {
+		return fmt.Errorf("exercise style must be AMERICAN or EUROPEAN")
+	}
 	return nil
 }
 
-// =================================================
-// 6) Monte Carlo Asset Price Simulation
-// =================================================
-func assetPriceSim(S0, r, T, sigma float64, steps, pathCount int) [][]float64 {
-	// Path Count (N): The number of parallel universes you simulate, eg: 100 different universes
-	// Time Steps (M): Number of stops you make in a single path, think of it as closing period
-	// eg: 252 steps as standard
+func priceEuropean(input PricingInput) (PricingResult, error) {
+	values := make([]float64, input.Simulations)
+	discount := math.Exp(-input.Rate * input.TimeYears)
+	drift := (input.Rate - input.DividendYield - 0.5*input.Volatility*input.Volatility) * input.TimeYears
+	diffusion := input.Volatility * math.Sqrt(input.TimeYears)
 
-	dt := T / float64(steps)
-	drift := (r - math.Pow(sigma, 2)/2.0) * dt // Drift does not change since it all constants
-	volatilitySq := sigma * math.Sqrt(dt)
+	parallelFor(input.Simulations, input.Workers, func(index int) {
+		rng := rand.New(rand.NewSource(deriveSeed(input.Seed, index)))
+		terminalPrice := input.Spot * math.Exp(drift+diffusion*rng.NormFloat64())
+		values[index] = discount * intrinsicValue(terminalPrice, input.Strike, input.ContractType)
+	})
 
-	// Asset Price is 2D x-Price and y-Time steps
-	paths := make([][]float64, pathCount)
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < pathCount; i++ { // Outer loop runs once for each 'universe'
-
-		wg.Add(1)
-
-		go func(pathIndex int) {
-
-			defer wg.Done()
-			path := make([]float64, steps+1) // Needs step+1 because Day start from 0
-			path[0] = S0                     // Every 'universe' or version, start with current stock price
-			st := S0
-			localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(pathIndex)))
-
-			for j := 0; j < steps; j++ { // Inner loop advances time day-by-day
-				z := localRand.NormFloat64()
-				diffusion := volatilitySq * z
-				st = st * math.Exp(drift+diffusion)
-				path[j+1] = st // Save price into today's slot
-			}
-			paths[pathIndex] = path
-		}(i)
-	}
-	wg.Wait()
-	return paths
+	price, standardError := meanAndStandardError(values)
+	return PricingResult{
+		Price:          price,
+		StandardError:  standardError,
+		SimulatedPaths: input.Simulations,
+	}, nil
 }
 
-// =================================================
-// 7) Store 2D Asset Price in CSV
-// =================================================
-func writeAssetPriceCSV(grid [][]float64) error {
-
-	// Instead of Store it vertical like the 3D Heatmap
-	// Python's Line Plotter treats each row as a single continuous line
-
-	fileName := "AssetPrice.csv"
-	file, err := os.Create(fileName) // Create file, if exist, return err
+func priceAmericanLSM(input PricingInput) (PricingResult, error) {
+	paths, err := assetPriceSim(input)
 	if err != nil {
-		return fmt.Errorf("\n\tFailed to Create CSV: %v", err)
+		return PricingResult{}, err
 	}
-	defer file.Close() // Ensure file Close
+	dt := input.TimeYears / float64(input.Steps)
+	cashflows := make([]float64, input.Simulations)
+	exerciseStep := make([]int, input.Simulations)
+	europeanValues := make([]float64, input.Simulations)
+	terminalDiscount := math.Exp(-input.Rate * input.TimeYears)
 
-	w := csv.NewWriter(file) // Create "Writer", auto handle Escaping Special Char and auto add commas
-	defer w.Flush()          // "Flush" data to the file, w/o this, file might Corrupted/Empty
-	// Always place after NewWriter
-
-	// 1. Generate a matching header for ALL columns (Step_0, Step_1, ... Step_N)
-	if len(grid) > 0 {
-		header := make([]string, len(grid[0]))
-		for step := 0; step < len(grid[0]); step++ {
-			header[step] = fmt.Sprintf("Step_%d", step)
-		}
-		if err := w.Write(header); err != nil {
-			return err
-		}
+	for pathIndex := range paths {
+		terminalPayoff := intrinsicValue(paths[pathIndex][input.Steps], input.Strike, input.ContractType)
+		cashflows[pathIndex] = terminalPayoff
+		exerciseStep[pathIndex] = input.Steps
+		europeanValues[pathIndex] = terminalDiscount * terminalPayoff
 	}
 
-	for i := 0; i < len(grid); i++ {
-		row := make([]string, len(grid[i]))
-
-		for j, price := range grid[i] {
-			row[j] = strconv.FormatFloat(price, 'f', 2, 64)
+	for step := input.Steps - 1; step >= 1; step-- {
+		x := make([]float64, 0, input.Simulations)
+		y := make([]float64, 0, input.Simulations)
+		indices := make([]int, 0, input.Simulations)
+		for pathIndex := range paths {
+			spot := paths[pathIndex][step]
+			if intrinsicValue(spot, input.Strike, input.ContractType) <= 0 {
+				continue
+			}
+			discountToStep := math.Exp(-input.Rate * dt * float64(exerciseStep[pathIndex]-step))
+			x = append(x, spot/input.Spot)
+			y = append(y, cashflows[pathIndex]*discountToStep)
+			indices = append(indices, pathIndex)
 		}
-		if err := w.Write(row); err != nil {
-			return err // Write that single data row (include 3 elements) to CSV
+		if len(indices) == 0 {
+			continue
 		}
 
+		coefficients, fitted := fitQuadratic(x, y)
+		fallbackContinuation, _ := meanAndStandardError(y)
+		for position, pathIndex := range indices {
+			normalizedSpot := x[position]
+			continuation := fallbackContinuation
+			if fitted {
+				continuation = coefficients[0] + coefficients[1]*normalizedSpot + coefficients[2]*normalizedSpot*normalizedSpot
+			}
+			continuation = math.Max(continuation, 0)
+			immediateExercise := intrinsicValue(paths[pathIndex][step], input.Strike, input.ContractType)
+			if immediateExercise > continuation {
+				cashflows[pathIndex] = immediateExercise
+				exerciseStep[pathIndex] = step
+			}
+		}
 	}
 
-	fmt.Printf("\n\tSuccessfully Store Data in %v!\n", fileName)
+	americanValues := make([]float64, input.Simulations)
+	for pathIndex := range cashflows {
+		americanValues[pathIndex] = cashflows[pathIndex] * math.Exp(-input.Rate*dt*float64(exerciseStep[pathIndex]))
+	}
+	americanPrice, americanSE := meanAndStandardError(americanValues)
+	europeanPrice, europeanSE := meanAndStandardError(europeanValues)
+	intrinsic := intrinsicValue(input.Spot, input.Strike, input.ContractType)
+
+	result := PricingResult{
+		Price:          americanPrice,
+		StandardError:  americanSE,
+		SimulatedPaths: input.Simulations,
+	}
+	// LSM is a lower-bound estimator. Enforce basic no-arbitrage lower bounds.
+	if europeanPrice > result.Price {
+		result.Price = europeanPrice
+		result.StandardError = europeanSE
+	}
+	if intrinsic > result.Price {
+		result.Price = intrinsic
+		result.StandardError = 0
+	}
+	return result, nil
+}
+
+func fitQuadratic(x, y []float64) ([3]float64, bool) {
+	if len(x) != len(y) || len(x) < 3 {
+		return [3]float64{}, false
+	}
+	var sx, sx2, sx3, sx4 float64
+	var sy, sxy, sx2y float64
+	for i := range x {
+		x2 := x[i] * x[i]
+		sx += x[i]
+		sx2 += x2
+		sx3 += x2 * x[i]
+		sx4 += x2 * x2
+		sy += y[i]
+		sxy += x[i] * y[i]
+		sx2y += x2 * y[i]
+	}
+	matrix := [3][4]float64{
+		{float64(len(x)), sx, sx2, sy},
+		{sx, sx2, sx3, sxy},
+		{sx2, sx3, sx4, sx2y},
+	}
+
+	for column := 0; column < 3; column++ {
+		pivot := column
+		for row := column + 1; row < 3; row++ {
+			if math.Abs(matrix[row][column]) > math.Abs(matrix[pivot][column]) {
+				pivot = row
+			}
+		}
+		if math.Abs(matrix[pivot][column]) < 1e-12 {
+			return [3]float64{}, false
+		}
+		matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+		pivotValue := matrix[column][column]
+		for entry := column; entry < 4; entry++ {
+			matrix[column][entry] /= pivotValue
+		}
+		for row := 0; row < 3; row++ {
+			if row == column {
+				continue
+			}
+			factor := matrix[row][column]
+			for entry := column; entry < 4; entry++ {
+				matrix[row][entry] -= factor * matrix[column][entry]
+			}
+		}
+	}
+	return [3]float64{matrix[0][3], matrix[1][3], matrix[2][3]}, true
+}
+
+func intrinsicValue(spot, strike float64, contractType string) float64 {
+	if contractType == callContract {
+		return math.Max(spot-strike, 0)
+	}
+	return math.Max(strike-spot, 0)
+}
+
+func meanAndStandardError(values []float64) (float64, float64) {
+	if len(values) == 0 {
+		return 0, 0
+	}
+	var sum float64
+	for _, value := range values {
+		sum += value
+	}
+	mean := sum / float64(len(values))
+	if len(values) == 1 {
+		return mean, 0
+	}
+	var squaredDifferences float64
+	for _, value := range values {
+		difference := value - mean
+		squaredDifferences += difference * difference
+	}
+	variance := squaredDifferences / float64(len(values)-1)
+	return mean, math.Sqrt(variance / float64(len(values)))
+}
+
+func expirationDate(start float64) []float64 {
+	expirations := make([]float64, 5)
+	for index := range expirations {
+		expirations[index] = start + float64(index*7)
+	}
+	return expirations
+}
+
+func strikePrice(spot float64) []float64 {
+	return []float64{spot * 0.90, spot * 0.95, spot, spot * 1.05, spot * 1.10}
+}
+
+func parkinsonVolatility(high, low float64) (float64, error) {
+	if !isFinitePositive(high) || !isFinitePositive(low) || high <= low {
+		return 0, fmt.Errorf("high and low must be finite positive values with high greater than low")
+	}
+	logRange := math.Log(high / low)
+	dailyVariance := (logRange * logRange) / (4 * math.Log(2))
+	return math.Sqrt(dailyVariance * 252), nil
+}
+
+func assetPriceSim(input PricingInput) ([][]float64, error) {
+	if !isFinitePositive(input.Spot) {
+		return nil, fmt.Errorf("spot price must be finite and greater than zero")
+	}
+	if !isFinite(input.Rate) || input.Rate <= -1 {
+		return nil, fmt.Errorf("risk-free rate must be finite and greater than -100%%")
+	}
+	if !isFinite(input.DividendYield) || input.DividendYield < 0 {
+		return nil, fmt.Errorf("dividend yield must be finite and nonnegative")
+	}
+	if !isFinite(input.TimeYears) || input.TimeYears < 0 {
+		return nil, fmt.Errorf("time horizon must be finite and nonnegative")
+	}
+	if !isFinitePositive(input.Volatility) {
+		return nil, fmt.Errorf("volatility must be finite and greater than zero")
+	}
+	if input.Steps <= 0 || input.Simulations <= 0 {
+		return nil, fmt.Errorf("steps and path count must be greater than zero")
+	}
+	if input.Seed == 0 {
+		input.Seed = time.Now().UnixNano()
+	}
+
+	dt := input.TimeYears / float64(input.Steps)
+	drift := (input.Rate - input.DividendYield - 0.5*input.Volatility*input.Volatility) * dt
+	diffusion := input.Volatility * math.Sqrt(dt)
+	paths := make([][]float64, input.Simulations)
+	parallelFor(input.Simulations, input.Workers, func(pathIndex int) {
+		rng := rand.New(rand.NewSource(deriveSeed(input.Seed, pathIndex)))
+		path := make([]float64, input.Steps+1)
+		path[0] = input.Spot
+		for step := 0; step < input.Steps; step++ {
+			path[step+1] = path[step] * math.Exp(drift+diffusion*rng.NormFloat64())
+		}
+		paths[pathIndex] = path
+	})
+	return paths, nil
+}
+
+func parallelFor(total, requestedWorkers int, operation func(index int)) {
+	workers := requestedWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers > total {
+		workers = total
+	}
+	var waitGroup sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * total / workers
+		end := (worker + 1) * total / workers
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			for index := start; index < end; index++ {
+				operation(index)
+			}
+		}()
+	}
+	waitGroup.Wait()
+}
+
+func deriveSeed(base int64, index int) int64 {
+	value := uint64(base) + 0x9e3779b97f4a7c15*uint64(index+1)
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	value ^= value >> 31
+	return int64(value)
+}
+
+func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors [][]float64) error {
+	if len(prices) != len(sim.StrikePrice) || len(standardErrors) != len(sim.StrikePrice) {
+		return fmt.Errorf("price grids do not match strike count")
+	}
+	rows := make([][]string, 0, len(sim.StrikePrice)*len(sim.ExpirationDays)+1)
+	rows = append(rows, []string{
+		"Strike_X",
+		"Expiration_Y",
+		"OptionPrice_Z",
+		"StandardError",
+		"ContractType",
+		"ExerciseStyle",
+		"DividendYield",
+		"RiskFreeRate",
+		"Volatility",
+		"Seed",
+	})
+	for rowIndex, strike := range sim.StrikePrice {
+		if len(prices[rowIndex]) != len(sim.ExpirationDays) || len(standardErrors[rowIndex]) != len(sim.ExpirationDays) {
+			return fmt.Errorf("price grid row %d does not match expiration count", rowIndex)
+		}
+		for columnIndex, days := range sim.ExpirationDays {
+			rows = append(rows, []string{
+				strconv.FormatFloat(strike, 'f', 2, 64),
+				strconv.FormatFloat(days, 'f', 0, 64),
+				strconv.FormatFloat(prices[rowIndex][columnIndex], 'f', 6, 64),
+				strconv.FormatFloat(standardErrors[rowIndex][columnIndex], 'f', 6, 64),
+				sim.CallOrPut,
+				sim.ExerciseStyle,
+				strconv.FormatFloat(sim.DividendYield, 'f', 8, 64),
+				strconv.FormatFloat(sim.RiskFreeRate, 'f', 8, 64),
+				strconv.FormatFloat(sim.Volatility, 'f', 8, 64),
+				strconv.FormatInt(sim.Seed, 10),
+			})
+		}
+	}
+	return writeCSV(filename, rows)
+}
+
+func writeAssetPriceCSV(filename string, paths [][]float64) error {
+	if len(paths) == 0 || len(paths[0]) == 0 {
+		return fmt.Errorf("asset-price grid is empty")
+	}
+	columns := len(paths[0])
+	rows := make([][]string, 0, len(paths)+1)
+	header := make([]string, columns)
+	for step := range header {
+		header[step] = fmt.Sprintf("Step_%d", step)
+	}
+	rows = append(rows, header)
+	for pathIndex, path := range paths {
+		if len(path) != columns {
+			return fmt.Errorf("asset-price path %d has %d columns; expected %d", pathIndex, len(path), columns)
+		}
+		row := make([]string, columns)
+		for step, price := range path {
+			row[step] = strconv.FormatFloat(price, 'f', 6, 64)
+		}
+		rows = append(rows, row)
+	}
+	return writeCSV(filename, rows)
+}
+
+func writeCSV(filename string, rows [][]string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", filename, err)
+	}
+	writer := csv.NewWriter(file)
+	for _, row := range rows {
+		if err := writer.Write(row); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("write %s: %w", filename, err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("flush %s: %w", filename, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", filename, err)
+	}
 	return nil
 }
 
-func formatNumber(num float64) string {
-	if num >= 1_000_000_000_000 {
-		return fmt.Sprintf("%.2fT", float64(num)/1_000_000_000_000)
+func formatNumber(number float64) string {
+	absolute := math.Abs(number)
+	switch {
+	case absolute >= 1_000_000_000_000:
+		return fmt.Sprintf("%.2fT", number/1_000_000_000_000)
+	case absolute >= 1_000_000_000:
+		return fmt.Sprintf("%.2fB", number/1_000_000_000)
+	case absolute >= 1_000_000:
+		return fmt.Sprintf("%.2fM", number/1_000_000)
+	case absolute >= 1_000:
+		return fmt.Sprintf("%.2fK", number/1_000)
+	default:
+		return fmt.Sprintf("%.2f", number)
 	}
-	if num >= 1_000_000_000 {
-		return fmt.Sprintf("%.2fB", float64(num)/1_000_000_000)
-	}
-	if num >= 1_000_000 {
-		return fmt.Sprintf("%.2fM", float64(num)/1_000_000)
-	}
-	if num >= 1_000 {
-		return fmt.Sprintf("%.2fK", float64(num)/1_000)
-	}
-	return fmt.Sprintf("%.2f", num)
 }
