@@ -8,6 +8,7 @@ import (
 )
 
 type PricingGrids struct {
+	Details       [][]PricingResult
 	Price         [][]float64
 	StandardError [][]float64
 	ExecutionTime [][]float64
@@ -17,34 +18,40 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 	rows := len(sim.StrikePrice)
 	columns := len(sim.ExpirationDays)
 	results := PricingGrids{
+		Details:       make([][]PricingResult, rows),
 		Price:         makeGrid(rows, columns),
 		StandardError: makeGrid(rows, columns),
 		ExecutionTime: makeGrid(rows, columns),
 	}
 
-	fmt.Fprintln(output, "\n================ OPTION PRICE SIMULATION ================")
-	fmt.Fprintf(output, "Symbol: %s\tVolume: %s\n", sim.StockSymbol, formatNumber(sim.Volume))
-	fmt.Fprintf(output, "Contract: %s\tExercise: %s\n", sim.CallOrPut, sim.ExerciseStyle)
-	fmt.Fprintf(output, "Spot: $%.2f\tRate: %.3f%%\tDividend: %.3f%%\tVolatility: %.3f%%\n",
-		sim.UnderlyingPrice,
-		sim.RiskFreeRate*100,
-		sim.DividendYield*100,
-		sim.Volatility*100,
-	)
+	fmt.Fprintln(output, "\n================ MONTE CARLO SIMULATION ================")
+	fmt.Fprintf(output, "%-32sVolume: %s\n", "Symbol: "+sim.StockSymbol, formatNumber(sim.Volume))
+	fmt.Fprintf(output, "%-32sExercise: %s\n", "Contract: "+sim.CallOrPut, sim.ExerciseStyle)
+	fmt.Fprintf(output, "%-32s%-28sVolatility: %.3f%%\n",
+		fmt.Sprintf("Spot: $%.2f", sim.UnderlyingPrice), fmt.Sprintf("Dividend: %.3f%%", sim.DividendYield*100), sim.Volatility*100)
 	fmt.Fprintf(output, "Volatility source: %s\n", sim.VolatilitySource)
 	fmt.Fprintf(output, "Paths per contract: %d\tSeed: %d\n", sim.Simulation, sim.Seed)
 
+	if sim.ExerciseStyle == americanStyle {
+		count := sim.TrainingPaths
+		if count == 0 {
+			count = defaultTrainingPaths
+		}
+		fmt.Fprintf(output, "Training Path per contract: %d\n", count)
+	}
 	for row, strike := range sim.StrikePrice {
+		results.Details[row] = make([]PricingResult, columns)
 		for column, days := range sim.ExpirationDays {
 			input := PricingInput{
 				Spot:          sim.UnderlyingPrice,
 				Strike:        strike,
-				Rate:          sim.RiskFreeRate,
+				Rate:          sim.rateAt(column).Rate,
 				DividendYield: sim.DividendYield,
 				TimeYears:     effectiveTimeYears(days),
 				Volatility:    sim.Volatility,
 				Steps:         stepsForDays(days),
 				Simulations:   sim.Simulation,
+				TrainingPaths: sim.TrainingPaths,
 				ContractType:  sim.CallOrPut,
 				ExerciseStyle: sim.ExerciseStyle,
 				Seed:          deriveSeed(sim.Seed, row*columns+column),
@@ -54,6 +61,7 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 			if err != nil {
 				return PricingGrids{}, fmt.Errorf("price strike %.2f at %.0f DTE: %w", strike, days, err)
 			}
+			results.Details[row][column] = result
 			results.Price[row][column] = result.Price
 			results.StandardError[row][column] = result.StandardError
 			results.ExecutionTime[row][column] = result.ExecutionTime
@@ -69,6 +77,20 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 	printGrid(output, "EXECUTION TIME", sim, results.ExecutionTime, func(value float64) string {
 		return fmt.Sprintf("%.1fms", value)
 	})
+	if sim.ExerciseStyle == americanStyle {
+		fmt.Fprintln(output, "\n---------------- AMERICAN DIAGNOSTICS ----------------")
+		table := tabwriter.NewWriter(output, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(table, "Strike\tDTE\t95% interval\tAdjustment\tEarly exercise")
+		for row, strike := range sim.StrikePrice {
+			for col, days := range sim.ExpirationDays {
+				r := results.Details[row][col]
+				early := r.SimulatedPaths - r.ExerciseCounts[len(r.ExerciseCounts)-1]
+				fmt.Fprintf(table, "$%.2f\t%.0fd\t[%.4f, %.4f]\t$%.4f\t%.2f%%\n", strike, days, r.ConfidenceLow, r.ConfidenceHigh, r.BoundAdjustment, 100*float64(early)/float64(r.SimulatedPaths))
+			}
+		}
+		_ = table.Flush()
+	}
+
 	return results, nil
 }
 

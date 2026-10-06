@@ -15,3 +15,10 @@ coverage.out
 main
 .DS_Store
 .vscode/
+
+# Public FRED observations cached locally
+.cache/
+
+# Local API keys and environment secrets
+.env
+.env.*

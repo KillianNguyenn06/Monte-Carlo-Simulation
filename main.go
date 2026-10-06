@@ -26,6 +26,8 @@ type stockAPI struct {
 }
 
 type MonteCarlo struct {
+	TrainingPaths    int
+	Rates            []RateSelection
 	StockSymbol      string
 	UnderlyingPrice  float64
 	RiskFreeRate     float64
@@ -155,6 +157,14 @@ func collectInput(ctx context.Context, reader *bufio.Reader, writer io.Writer, s
 		return err
 	}
 	sim.ExerciseStyle = style
+	if style == americanStyle {
+		defaultCount := float64(defaultTrainingPaths)
+		count, err := promptFloat(reader, writer, "Training paths (additional to 100,000 valuation paths)", &defaultCount, func(v float64) bool { return isFinite(v) && v >= 3 && v <= 1_000_000 && v == math.Trunc(v) })
+		if err != nil {
+			return err
+		}
+		sim.TrainingPaths = int(count)
+	}
 
 	defaultDividend := sim.DividendYield * 100
 	dividend, err := promptFloat(reader, writer, "Annual dividend yield (%)", &defaultDividend, func(value float64) bool {
@@ -165,14 +175,9 @@ func collectInput(ctx context.Context, reader *bufio.Reader, writer io.Writer, s
 	}
 	sim.DividendYield = dividend / 100
 
-	defaultRate := sim.RiskFreeRate * 100
-	rate, err := promptFloat(reader, writer, "Annual risk-free rate (%)", &defaultRate, func(value float64) bool {
-		return isFinite(value) && value > -100 && value <= 100
-	})
-	if err != nil {
+	if err := configureRates(ctx, reader, writer, sim, loadTreasuryRates); err != nil {
 		return err
 	}
-	sim.RiskFreeRate = rate / 100
 
 	defaultVolatility := sim.Volatility * 100
 	volatility, err := promptFloat(reader, writer, "Annual volatility (%)", &defaultVolatility, func(value float64) bool {
@@ -278,7 +283,6 @@ func readLine(reader *bufio.Reader) (string, error) {
 func run(ctx context.Context, reader *bufio.Reader, writer io.Writer) error {
 	simulation := &MonteCarlo{
 		Simulation:    100_000,
-		RiskFreeRate:  0.0455,
 		DividendYield: 0,
 		PathCount:     100,
 	}
@@ -294,7 +298,7 @@ func run(ctx context.Context, reader *bufio.Reader, writer io.Writer) error {
 	maxDays := simulation.ExpirationDays[len(simulation.ExpirationDays)-1]
 	assetPrice, err := assetPriceSim(PricingInput{
 		Spot:          simulation.UnderlyingPrice,
-		Rate:          simulation.RiskFreeRate,
+		Rate:          simulation.rateAt(len(simulation.ExpirationDays) - 1).Rate,
 		DividendYield: simulation.DividendYield,
 		TimeYears:     maxDays / 365,
 		Volatility:    simulation.Volatility,
@@ -317,10 +321,10 @@ func run(ctx context.Context, reader *bufio.Reader, writer io.Writer) error {
 		fmt.Fprintln(writer, "No files were written.")
 		return nil
 	}
-	if err := writeHeatMapCSV("MonteCarloSim.csv", simulation, results.Price, results.StandardError); err != nil {
+	if err := writeHeatMapCSV("MonteCarloSim.csv", simulation, results.Price, results.StandardError, results.Details); err != nil {
 		return err
 	}
-	if err := writeAssetPriceCSV("AssetPrice.csv", assetPrice); err != nil {
+	if err := writeAssetPriceCSV("AssetPrice.csv", assetPrice, maxDays); err != nil {
 		return err
 	}
 	fmt.Fprintln(writer, "Saved MonteCarloSim.csv and AssetPrice.csv.")

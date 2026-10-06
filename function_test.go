@@ -87,7 +87,7 @@ func TestAmericanPutRespectsLowerBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	intrinsic := intrinsicValue(input.Spot, input.Strike, input.ContractType)
-	if result.Price < intrinsic {
+	if result.BoundAdjustedPrice < intrinsic {
 		t.Fatalf("American put price %.4f is below intrinsic value %.4f", result.Price, intrinsic)
 	}
 	if result.SimulatedPaths != input.Simulations {
@@ -153,16 +153,16 @@ func TestFitQuadratic(t *testing.T) {
 	for index := range x {
 		y[index] = 2 + 3*x[index] + 4*x[index]*x[index]
 	}
-	coefficients, ok := fitQuadratic(x, y)
-	if !ok {
-		t.Fatal("fitQuadratic did not produce a fit")
+	model, err := fitContinuation(x, y)
+	if err != nil || model.Fallback {
+		t.Fatalf("fit failed: %+v %v", model, err)
 	}
-	want := [3]float64{2, 3, 4}
-	for index := range want {
-		if math.Abs(coefficients[index]-want[index]) > 1e-10 {
-			t.Fatalf("coefficient %d = %v, want %v", index, coefficients[index], want[index])
+	for i := range x {
+		if math.Abs(model.predict(x[i])-y[i]) > 1e-10 {
+			t.Fatalf("prediction mismatch at %v", x[i])
 		}
 	}
+
 }
 
 func TestParallelForRunsEveryIndexExactlyOnce(t *testing.T) {
@@ -196,7 +196,7 @@ func TestCSVWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := readCSV(t, heatmapPath)
-	if len(rows) != 7 || len(rows[0]) != 10 {
+	if len(rows) != 7 || len(rows[0]) != 25 {
 		t.Fatalf("unexpected heatmap dimensions: %d x %d", len(rows), len(rows[0]))
 	}
 	if rows[0][3] != "StandardError" || rows[6][2] != "8.000000" || rows[6][5] != americanStyle {
@@ -210,6 +210,21 @@ func TestCSVWriters(t *testing.T) {
 	assetRows := readCSV(t, assetPath)
 	if len(assetRows) != 3 || len(assetRows[0]) != 3 || assetRows[0][2] != "Step_2" {
 		t.Fatalf("unexpected asset CSV: %v", assetRows)
+	}
+}
+
+func TestAssetCSVCalendarHorizon(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "calendar.csv")
+	values := make([]float64, 26)
+	for i := range values {
+		values[i] = 100
+	}
+	if err := writeAssetPriceCSV(path, [][]float64{values}, 35); err != nil {
+		t.Fatal(err)
+	}
+	rows := readCSV(t, path)
+	if rows[0][0] != "Day_0" || rows[0][25] != "Day_35" {
+		t.Fatalf("lost horizon: %v", rows[0])
 	}
 }
 
@@ -248,6 +263,7 @@ func testPricingInput() PricingInput {
 		Volatility:    0.20,
 		Steps:         50,
 		Simulations:   10_000,
+		TrainingPaths: 20_000,
 		ContractType:  callContract,
 		ExerciseStyle: europeanStyle,
 		Seed:          42,

@@ -61,6 +61,21 @@ class PathDataTests(unittest.TestCase):
             figure = create_path_figure(frame)
             self.assertEqual(len(figure.data), 2)
 
+    def test_calendar_horizon_and_legacy_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "paths.csv"
+            pd.DataFrame([[100, 101, 102]], columns=["Day_0", "Day_17.5", "Day_35"]).to_csv(path, index=False)
+            figure = create_path_figure(load_path_data(path))
+            self.assertEqual(list(figure.data[0].x), [0, 17.5, 35])
+            self.assertEqual(figure.layout.xaxis.title.text, "Calendar days from valuation")
+            self.assertEqual(figure.layout.hovermode, "closest")
+            legacy = pd.DataFrame([[100] * 26], columns=[f"Step_{i}" for i in range(26)])
+            figure = create_path_figure(legacy, horizon_days=35)
+            self.assertEqual(figure.data[0].x[-1], 35)
+            self.assertEqual(len(figure.data[0].x), 26)
+            with self.assertRaises(ValueError):
+                create_path_figure(load_path_data(path), horizon_days=252)
+
     def test_invalid_headers_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             csv_path = Path(directory) / "paths.csv"

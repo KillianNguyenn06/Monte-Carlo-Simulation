@@ -21,7 +21,12 @@ const (
 	tradingDaysPerYear = 252
 )
 
+const defaultTrainingPaths = 50_000
+
 type PricingInput struct {
+	TrainingPaths int   // Zero selects defaultTrainingPaths; separate from valuation count.
+	TrainingSeed  int64 // Zero derives a separate stream from Seed.
+	ValuationSeed int64 // Zero derives a separate stream from Seed.
 	Spot          float64
 	Strike        float64
 	Rate          float64
@@ -37,11 +42,23 @@ type PricingInput struct {
 }
 
 type PricingResult struct {
-	Price          float64
-	StandardError  float64
-	ExecutionTime  float64
-	SimulatedPaths int
-	Seed           int64
+	TrainingPaths       int
+	TrainingSeed        int64
+	ValuationSeed       int64
+	ConfidenceLow       float64
+	ConfidenceHigh      float64
+	EuropeanPrice       float64
+	Intrinsic           float64
+	BoundAdjustedPrice  float64 // Diagnostic only; Price and its SE remain unadjusted.
+	BoundAdjustment     float64
+	FallbackRegressions int
+	NoITMSteps          int
+	ExerciseCounts      []int
+	Price               float64
+	StandardError       float64
+	ExecutionTime       float64
+	SimulatedPaths      int
+	Seed                int64
 }
 
 func PriceOption(input PricingInput) (PricingResult, error) {
@@ -61,6 +78,10 @@ func PriceOption(input PricingInput) (PricingResult, error) {
 		result, err = priceAmericanLSM(input)
 	} else {
 		result, err = priceEuropean(input)
+	}
+	if err == nil {
+		result.ConfidenceLow = result.Price - 1.959963984540054*result.StandardError
+		result.ConfidenceHigh = result.Price + 1.959963984540054*result.StandardError
 	}
 	result.ExecutionTime = float64(time.Since(start).Microseconds()) / 1_000
 	result.Seed = input.Seed
@@ -92,6 +113,12 @@ func validatePricingInput(input PricingInput) error {
 	if input.Simulations <= 0 {
 		return fmt.Errorf("simulations must be greater than zero")
 	}
+	if input.TrainingPaths < 0 {
+		return fmt.Errorf("training path count must be nonnegative (zero selects the default)")
+	}
+	if input.ExerciseStyle == americanStyle && (input.Simulations < 2 || input.TrainingPaths == 1 || input.TrainingPaths == 2) {
+		return fmt.Errorf("American pricing requires at least 2 valuation paths and 3 training paths")
+	}
 	if input.ContractType != callContract && input.ContractType != putContract {
 		return fmt.Errorf("contract type must be CALL or PUT")
 	}
@@ -119,134 +146,6 @@ func priceEuropean(input PricingInput) (PricingResult, error) {
 		StandardError:  standardError,
 		SimulatedPaths: input.Simulations,
 	}, nil
-}
-
-func priceAmericanLSM(input PricingInput) (PricingResult, error) {
-	paths, err := assetPriceSim(input)
-	if err != nil {
-		return PricingResult{}, err
-	}
-	dt := input.TimeYears / float64(input.Steps)
-	cashflows := make([]float64, input.Simulations)
-	exerciseStep := make([]int, input.Simulations)
-	europeanValues := make([]float64, input.Simulations)
-	terminalDiscount := math.Exp(-input.Rate * input.TimeYears)
-
-	for pathIndex := range paths {
-		terminalPayoff := intrinsicValue(paths[pathIndex][input.Steps], input.Strike, input.ContractType)
-		cashflows[pathIndex] = terminalPayoff
-		exerciseStep[pathIndex] = input.Steps
-		europeanValues[pathIndex] = terminalDiscount * terminalPayoff
-	}
-
-	for step := input.Steps - 1; step >= 1; step-- {
-		x := make([]float64, 0, input.Simulations)
-		y := make([]float64, 0, input.Simulations)
-		indices := make([]int, 0, input.Simulations)
-		for pathIndex := range paths {
-			spot := paths[pathIndex][step]
-			if intrinsicValue(spot, input.Strike, input.ContractType) <= 0 {
-				continue
-			}
-			discountToStep := math.Exp(-input.Rate * dt * float64(exerciseStep[pathIndex]-step))
-			x = append(x, spot/input.Spot)
-			y = append(y, cashflows[pathIndex]*discountToStep)
-			indices = append(indices, pathIndex)
-		}
-		if len(indices) == 0 {
-			continue
-		}
-
-		coefficients, fitted := fitQuadratic(x, y)
-		fallbackContinuation, _ := meanAndStandardError(y)
-		for position, pathIndex := range indices {
-			normalizedSpot := x[position]
-			continuation := fallbackContinuation
-			if fitted {
-				continuation = coefficients[0] + coefficients[1]*normalizedSpot + coefficients[2]*normalizedSpot*normalizedSpot
-			}
-			continuation = math.Max(continuation, 0)
-			immediateExercise := intrinsicValue(paths[pathIndex][step], input.Strike, input.ContractType)
-			if immediateExercise > continuation {
-				cashflows[pathIndex] = immediateExercise
-				exerciseStep[pathIndex] = step
-			}
-		}
-	}
-
-	americanValues := make([]float64, input.Simulations)
-	for pathIndex := range cashflows {
-		americanValues[pathIndex] = cashflows[pathIndex] * math.Exp(-input.Rate*dt*float64(exerciseStep[pathIndex]))
-	}
-	americanPrice, americanSE := meanAndStandardError(americanValues)
-	europeanPrice, europeanSE := meanAndStandardError(europeanValues)
-	intrinsic := intrinsicValue(input.Spot, input.Strike, input.ContractType)
-
-	result := PricingResult{
-		Price:          americanPrice,
-		StandardError:  americanSE,
-		SimulatedPaths: input.Simulations,
-	}
-	// LSM is a lower-bound estimator. Enforce basic no-arbitrage lower bounds.
-	if europeanPrice > result.Price {
-		result.Price = europeanPrice
-		result.StandardError = europeanSE
-	}
-	if intrinsic > result.Price {
-		result.Price = intrinsic
-		result.StandardError = 0
-	}
-	return result, nil
-}
-
-func fitQuadratic(x, y []float64) ([3]float64, bool) {
-	if len(x) != len(y) || len(x) < 3 {
-		return [3]float64{}, false
-	}
-	var sx, sx2, sx3, sx4 float64
-	var sy, sxy, sx2y float64
-	for i := range x {
-		x2 := x[i] * x[i]
-		sx += x[i]
-		sx2 += x2
-		sx3 += x2 * x[i]
-		sx4 += x2 * x2
-		sy += y[i]
-		sxy += x[i] * y[i]
-		sx2y += x2 * y[i]
-	}
-	matrix := [3][4]float64{
-		{float64(len(x)), sx, sx2, sy},
-		{sx, sx2, sx3, sxy},
-		{sx2, sx3, sx4, sx2y},
-	}
-
-	for column := 0; column < 3; column++ {
-		pivot := column
-		for row := column + 1; row < 3; row++ {
-			if math.Abs(matrix[row][column]) > math.Abs(matrix[pivot][column]) {
-				pivot = row
-			}
-		}
-		if math.Abs(matrix[pivot][column]) < 1e-12 {
-			return [3]float64{}, false
-		}
-		matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
-		pivotValue := matrix[column][column]
-		for entry := column; entry < 4; entry++ {
-			matrix[column][entry] /= pivotValue
-		}
-		for row := 0; row < 3; row++ {
-			if row == column {
-				continue
-			}
-			factor := matrix[row][column]
-			for entry := column; entry < 4; entry++ {
-				matrix[row][entry] -= factor * matrix[column][entry]
-			}
-		}
-	}
-	return [3]float64{matrix[0][3], matrix[1][3], matrix[2][3]}, true
 }
 
 func intrinsicValue(spot, strike float64, contractType string) float64 {
@@ -368,9 +267,19 @@ func deriveSeed(base int64, index int) int64 {
 	return int64(value)
 }
 
-func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors [][]float64) error {
+func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors [][]float64, details ...[][]PricingResult) error {
 	if len(prices) != len(sim.StrikePrice) || len(standardErrors) != len(sim.StrikePrice) {
 		return fmt.Errorf("price grids do not match strike count")
+	}
+	if len(details) > 0 {
+		if len(details[0]) != len(sim.StrikePrice) {
+			return fmt.Errorf("diagnostics do not match strikes")
+		}
+		for _, row := range details[0] {
+			if len(row) != len(sim.ExpirationDays) {
+				return fmt.Errorf("diagnostics do not match expirations")
+			}
+		}
 	}
 	rows := make([][]string, 0, len(sim.StrikePrice)*len(sim.ExpirationDays)+1)
 	rows = append(rows, []string{
@@ -384,12 +293,31 @@ func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors []
 		"RiskFreeRate",
 		"Volatility",
 		"Seed",
+		"RateSource", "RateObservationDate", "RateConvention",
+		"TrainingPaths", "ValuationPaths", "TrainingSeed", "ValuationSeed",
+		"RawPolicyPrice", "Conditional95Low", "Conditional95High",
+		"BoundAdjustedPrice", "BoundAdjustment", "FallbackRegressions", "NoITMSteps", "ExerciseCounts",
 	})
 	for rowIndex, strike := range sim.StrikePrice {
 		if len(prices[rowIndex]) != len(sim.ExpirationDays) || len(standardErrors[rowIndex]) != len(sim.ExpirationDays) {
 			return fmt.Errorf("price grid row %d does not match expiration count", rowIndex)
 		}
 		for columnIndex, days := range sim.ExpirationDays {
+			rate := sim.rateAt(columnIndex)
+			r := PricingResult{}
+			if len(details) > 0 {
+				r = details[0][rowIndex][columnIndex]
+			}
+			diagnostic := func(v float64) string {
+				if len(details) == 0 || sim.ExerciseStyle != americanStyle {
+					return ""
+				}
+				return strconv.FormatFloat(v, 'g', 17, 64)
+			}
+			counts := make([]string, len(r.ExerciseCounts))
+			for i, v := range r.ExerciseCounts {
+				counts[i] = strconv.Itoa(v)
+			}
 			rows = append(rows, []string{
 				strconv.FormatFloat(strike, 'f', 2, 64),
 				strconv.FormatFloat(days, 'f', 0, 64),
@@ -398,24 +326,34 @@ func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors []
 				sim.CallOrPut,
 				sim.ExerciseStyle,
 				strconv.FormatFloat(sim.DividendYield, 'f', 8, 64),
-				strconv.FormatFloat(sim.RiskFreeRate, 'f', 8, 64),
+				strconv.FormatFloat(rate.Rate, 'g', 17, 64),
 				strconv.FormatFloat(sim.Volatility, 'f', 8, 64),
 				strconv.FormatInt(sim.Seed, 10),
+				rate.Source, rate.ObservationDate, rate.Method,
+				strconv.Itoa(r.TrainingPaths), strconv.Itoa(r.SimulatedPaths), strconv.FormatInt(r.TrainingSeed, 10), strconv.FormatInt(r.ValuationSeed, 10),
+				diagnostic(r.Price), diagnostic(r.ConfidenceLow), diagnostic(r.ConfidenceHigh), diagnostic(r.BoundAdjustedPrice), diagnostic(r.BoundAdjustment), strconv.Itoa(r.FallbackRegressions), strconv.Itoa(r.NoITMSteps), strings.Join(counts, ";"),
 			})
 		}
 	}
 	return writeCSV(filename, rows)
 }
 
-func writeAssetPriceCSV(filename string, paths [][]float64) error {
+func writeAssetPriceCSV(filename string, paths [][]float64, horizonDays ...float64) error {
 	if len(paths) == 0 || len(paths[0]) == 0 {
 		return fmt.Errorf("asset-price grid is empty")
+	}
+	if len(horizonDays) > 1 || (len(horizonDays) == 1 && (!isFinitePositive(horizonDays[0]) || len(paths[0]) < 2)) {
+		return fmt.Errorf("calendar horizon must be finite and positive with at least two path points")
 	}
 	columns := len(paths[0])
 	rows := make([][]string, 0, len(paths)+1)
 	header := make([]string, columns)
 	for step := range header {
 		header[step] = fmt.Sprintf("Step_%d", step)
+		if len(horizonDays) == 1 {
+			day := float64(step) * horizonDays[0] / float64(columns-1)
+			header[step] = "Day_" + strconv.FormatFloat(day, 'g', 17, 64)
+		}
 	}
 	rows = append(rows, header)
 	for pathIndex, path := range paths {
