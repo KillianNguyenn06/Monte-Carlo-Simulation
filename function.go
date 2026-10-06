@@ -67,6 +67,11 @@ func PriceOption(input PricingInput) (PricingResult, error) {
 	if err := validatePricingInput(input); err != nil {
 		return PricingResult{}, err
 	}
+	// At expiry there is no Monte Carlo uncertainty or exercise strategy to learn.
+	if input.TimeYears == 0 {
+		payoff := intrinsicValue(input.Spot, input.Strike, input.ContractType)
+		return PricingResult{Price: payoff, ConfidenceLow: payoff, ConfidenceHigh: payoff, EuropeanPrice: payoff, Intrinsic: payoff, BoundAdjustedPrice: payoff, Seed: input.Seed}, nil
+	}
 	if input.Seed == 0 {
 		input.Seed = time.Now().UnixNano()
 	}
@@ -95,15 +100,25 @@ func validatePricingInput(input PricingInput) error {
 	if !isFinitePositive(input.Strike) {
 		return fmt.Errorf("strike price must be finite and greater than zero")
 	}
+	if !isFinite(input.TimeYears) || input.TimeYears < 0 {
+		return fmt.Errorf("time to expiration must be finite and nonnegative")
+	}
+	if input.ContractType != callContract && input.ContractType != putContract {
+		return fmt.Errorf("contract type must be CALL or PUT")
+	}
+	if input.ExerciseStyle != americanStyle && input.ExerciseStyle != europeanStyle {
+		return fmt.Errorf("exercise style must be AMERICAN or EUROPEAN")
+	}
+	if input.TimeYears == 0 {
+		return nil
+	}
 	if !isFinite(input.Rate) || input.Rate <= -1 {
 		return fmt.Errorf("risk-free rate must be finite and greater than -100%%")
 	}
 	if !isFinite(input.DividendYield) || input.DividendYield < 0 {
 		return fmt.Errorf("dividend yield must be finite and nonnegative")
 	}
-	if !isFinite(input.TimeYears) || input.TimeYears < 0 {
-		return fmt.Errorf("time to expiration must be finite and nonnegative")
-	}
+
 	if !isFinitePositive(input.Volatility) {
 		return fmt.Errorf("volatility must be finite and greater than zero")
 	}
@@ -119,12 +134,7 @@ func validatePricingInput(input PricingInput) error {
 	if input.ExerciseStyle == americanStyle && (input.Simulations < 2 || input.TrainingPaths == 1 || input.TrainingPaths == 2) {
 		return fmt.Errorf("American pricing requires at least 2 valuation paths and 3 training paths")
 	}
-	if input.ContractType != callContract && input.ContractType != putContract {
-		return fmt.Errorf("contract type must be CALL or PUT")
-	}
-	if input.ExerciseStyle != americanStyle && input.ExerciseStyle != europeanStyle {
-		return fmt.Errorf("exercise style must be AMERICAN or EUROPEAN")
-	}
+
 	return nil
 }
 
@@ -293,7 +303,7 @@ func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors []
 		"RiskFreeRate",
 		"Volatility",
 		"Seed",
-		"RateSource", "RateObservationDate", "RateConvention",
+		"RateSource", "RateObservationDate", "RateConvention", "ValuationTimestamp", "ExpirationTimestamp",
 		"TrainingPaths", "ValuationPaths", "TrainingSeed", "ValuationSeed",
 		"RawPolicyPrice", "Conditional95Low", "Conditional95High",
 		"BoundAdjustedPrice", "BoundAdjustment", "FallbackRegressions", "NoITMSteps", "ExerciseCounts",
@@ -320,7 +330,7 @@ func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors []
 			}
 			rows = append(rows, []string{
 				strconv.FormatFloat(strike, 'f', 2, 64),
-				strconv.FormatFloat(days, 'f', 0, 64),
+				strconv.FormatFloat(days, 'g', 17, 64),
 				strconv.FormatFloat(prices[rowIndex][columnIndex], 'f', 6, 64),
 				strconv.FormatFloat(standardErrors[rowIndex][columnIndex], 'f', 6, 64),
 				sim.CallOrPut,
@@ -329,7 +339,7 @@ func writeHeatMapCSV(filename string, sim *MonteCarlo, prices, standardErrors []
 				strconv.FormatFloat(rate.Rate, 'g', 17, 64),
 				strconv.FormatFloat(sim.Volatility, 'f', 8, 64),
 				strconv.FormatInt(sim.Seed, 10),
-				rate.Source, rate.ObservationDate, rate.Method,
+				rate.Source, rate.ObservationDate, rate.Method, timestampString(sim.ValuationTime), sim.expirationString(columnIndex),
 				strconv.Itoa(r.TrainingPaths), strconv.Itoa(r.SimulatedPaths), strconv.FormatInt(r.TrainingSeed, 10), strconv.FormatInt(r.ValuationSeed, 10),
 				diagnostic(r.Price), diagnostic(r.ConfidenceLow), diagnostic(r.ConfidenceHigh), diagnostic(r.BoundAdjustedPrice), diagnostic(r.BoundAdjustment), strconv.Itoa(r.FallbackRegressions), strconv.Itoa(r.NoITMSteps), strings.Join(counts, ";"),
 			})

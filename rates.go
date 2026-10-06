@@ -300,7 +300,7 @@ func configureRates(ctx context.Context, reader *bufio.Reader, writer io.Writer,
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(writer, "%.0f DTE: %.5f%% continuous, %s, observed %s\n", days, selections[i].Rate*100, selections[i].Source, selections[i].ObservationDate)
+				fmt.Fprintf(writer, "%s: %.5f%% continuous, %s, observed %s\n", formatDTE(days), selections[i].Rate*100, selections[i].Source, selections[i].ObservationDate)
 			}
 			fmt.Fprintln(writer, "Treasury par-as-zero approximation; constant rate per contract, not a bootstrapped discount curve.")
 			choice, err := promptChoice(reader, writer, "Use these rates or enter a manual override (Use/Manual): ", map[string]string{"USE": "USE", "U": "USE", "MANUAL": "MANUAL", "M": "MANUAL"})

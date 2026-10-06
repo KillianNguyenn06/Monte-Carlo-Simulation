@@ -196,7 +196,7 @@ func TestCSVWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := readCSV(t, heatmapPath)
-	if len(rows) != 7 || len(rows[0]) != 25 {
+	if len(rows) != 7 || len(rows[0]) != 27 {
 		t.Fatalf("unexpected heatmap dimensions: %d x %d", len(rows), len(rows[0]))
 	}
 	if rows[0][3] != "StandardError" || rows[6][2] != "8.000000" || rows[6][5] != americanStyle {

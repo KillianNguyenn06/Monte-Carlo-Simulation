@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"text/tabwriter"
+	"time"
 )
 
 type PricingGrids struct {
@@ -29,6 +30,13 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 	fmt.Fprintf(output, "%-32sExercise: %s\n", "Contract: "+sim.CallOrPut, sim.ExerciseStyle)
 	fmt.Fprintf(output, "%-32s%-28sVolatility: %.3f%%\n",
 		fmt.Sprintf("Spot: $%.2f", sim.UnderlyingPrice), fmt.Sprintf("Dividend: %.3f%%", sim.DividendYield*100), sim.Volatility*100)
+	if !sim.ValuationTime.IsZero() {
+		fmt.Fprintf(output, "Valuation: %s", sim.ValuationTime.Format(time.RFC3339))
+		if len(sim.Expirations) > 0 {
+			fmt.Fprintf(output, "   First expiration: %s", sim.expirationString(0))
+		}
+		fmt.Fprintln(output)
+	}
 	fmt.Fprintf(output, "Volatility source: %s\n", sim.VolatilitySource)
 	fmt.Fprintf(output, "Paths per contract: %d\tSeed: %d\n", sim.Simulation, sim.Seed)
 
@@ -59,7 +67,7 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 			}
 			result, err := PriceOption(input)
 			if err != nil {
-				return PricingGrids{}, fmt.Errorf("price strike %.2f at %.0f DTE: %w", strike, days, err)
+				return PricingGrids{}, fmt.Errorf("price strike %.2f at %s: %w", strike, formatDTE(days), err)
 			}
 			results.Details[row][column] = result
 			results.Price[row][column] = result.Price
@@ -84,8 +92,12 @@ func displayOption(sim *MonteCarlo, output io.Writer) (PricingGrids, error) {
 		for row, strike := range sim.StrikePrice {
 			for col, days := range sim.ExpirationDays {
 				r := results.Details[row][col]
-				early := r.SimulatedPaths - r.ExerciseCounts[len(r.ExerciseCounts)-1]
-				fmt.Fprintf(table, "$%.2f\t%.0fd\t[%.4f, %.4f]\t$%.4f\t%.2f%%\n", strike, days, r.ConfidenceLow, r.ConfidenceHigh, r.BoundAdjustment, 100*float64(early)/float64(r.SimulatedPaths))
+				earlyPercent := 0.0
+				if r.SimulatedPaths > 0 && len(r.ExerciseCounts) > 0 {
+					early := r.SimulatedPaths - r.ExerciseCounts[len(r.ExerciseCounts)-1]
+					earlyPercent = 100 * float64(early) / float64(r.SimulatedPaths)
+				}
+				fmt.Fprintf(table, "$%.2f\t%s\t[%.4f, %.4f]\t$%.4f\t%.2f%%\n", strike, formatDTE(days), r.ConfidenceLow, r.ConfidenceHigh, r.BoundAdjustment, earlyPercent)
 			}
 		}
 		_ = table.Flush()
@@ -107,7 +119,7 @@ func printGrid(output io.Writer, title string, sim *MonteCarlo, grid [][]float64
 	writer := tabwriter.NewWriter(output, 0, 0, 2, ' ', 0)
 	fmt.Fprint(writer, "Strike")
 	for _, days := range sim.ExpirationDays {
-		fmt.Fprintf(writer, "\t%.0fd", days)
+		fmt.Fprintf(writer, "\t%s", formatDTE(days))
 	}
 	fmt.Fprintln(writer)
 	for row, strike := range sim.StrikePrice {
@@ -121,9 +133,6 @@ func printGrid(output io.Writer, title string, sim *MonteCarlo, grid [][]float64
 }
 
 func effectiveTimeYears(days float64) float64 {
-	if days == 0 {
-		return 0.5 / 365
-	}
 	return days / 365
 }
 

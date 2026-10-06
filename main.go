@@ -26,6 +26,8 @@ type stockAPI struct {
 }
 
 type MonteCarlo struct {
+	ValuationTime    time.Time
+	Expirations      []time.Time
 	TrainingPaths    int
 	Rates            []RateSelection
 	StockSymbol      string
@@ -134,13 +136,10 @@ func collectInput(ctx context.Context, reader *bufio.Reader, writer io.Writer, s
 	}
 	fmt.Fprintf(writer, "\nFetched live quote for %s at $%.2f.\n", sim.StockSymbol, sim.UnderlyingPrice)
 
-	days, err := promptFloat(reader, writer, "Target days to expiration (DTE): ", nil, func(value float64) bool {
-		return isFinite(value) && value >= 0 && value == math.Trunc(value)
-	})
-	if err != nil {
+	sim.ValuationTime = time.Now().UTC()
+	if err := collectExpiration(reader, writer, sim); err != nil {
 		return err
 	}
-	sim.ExpirationDays = expirationDate(days)
 
 	contract, err := promptChoice(reader, writer, "Contract type (Call/Put): ", map[string]string{
 		"CALL": "CALL", "C": "CALL", "PUT": "PUT", "P": "PUT",
